@@ -1,7 +1,7 @@
 # GGUF Tools
 
 This repository contains a collection of small, **pure‑Python** utilities that help you
-inspect, edit, and compare GGUF (Graph Neural Network Universal Format) files.  The
+inspect, edit, and compare GGUF files.  The
 tools are geared toward researchers and engineers working with LLM quantization and
 conversion pipelines.  All scripts are intentionally lightweight – they only depend
 on the standard library, *numpy* and *gguf-py* (plus optional *torch* for GPU
