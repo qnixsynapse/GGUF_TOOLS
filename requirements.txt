@@ -1,0 +1,4 @@
+torch
+numpy
+gguf-py
+# Add any additional dependencies here

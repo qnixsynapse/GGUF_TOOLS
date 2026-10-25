@@ -1,0 +1,10 @@
+# Byte compiled Python files
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
+
+# IDE folders
+.idea/
+.vscode/
