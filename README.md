@@ -29,7 +29,6 @@ pip install -r requirements.txt
 ```
 ├── ggml-inspect_v2.py                # Inspect GGUF headers, tensors, and metadata
 ├── gguf_editor_standalone.py         # Lightweight Tkinter GUI for editing tensors/metadata
-├── gguf_manager.py                   # CLI helper – dump metadata, set values, and export
 ├── gguf_manager_tui_inplace.py       # Terminal UI for editing metadata on‑the‑fly
 ├── weight_compare.py                # Compute L2 / cosine differences between two GGUF checkpoints (CPU)
 ├── weight_compare_gpu.py            # GPU‑accelerated weight comparison (requires PyTorch)
@@ -41,7 +40,6 @@ pip install -r requirements.txt
 
 * **`ggml-inspect_v2.py`** – Inspect a GGUF file and display the header, tensor shapes, data types and optional metadata.
 * **`gguf_editor_standalone.py`** – Tkinter‑based GUI for viewing and editing tensors/metadata in place.  No external dependencies are required.
-* **`gguf_manager.py`** – Simple command‑line tool: dump metadata (`--dump`), change scalar or string fields (`--set key=value`), or write a modified copy (`--output`).
 * **`gguf_manager_tui_inplace.py`** – A lightweight terminal UI that lets you edit metadata on‑the‑fly without any external libraries.
 * **`weight_compare.py` / `weight_compare_gpu.py`** – Compute L2 / cosine differences between two GGUF checkpoints.  The GPU variant uses *PyTorch* for fast dequantisation and reductions.
 
@@ -50,12 +48,6 @@ pip install -r requirements.txt
 ```bash
 # Inspect a GGUF file
 python ggml-inspect_v2.py path/to/model.gguf
-
-# Dump metadata to the console
-python gguf_manager.py path/to/model.gguf --dump
-
-# Update a scalar field and write a new file
-python gguf_manager.py path/to/model.gguf --set "general.architecture=MyModel" --output model_modified.gguf
 
 # Compare two checkpoints on the CPU
 python weight_compare.py model_ref.gguf model_test.gguf
@@ -90,4 +82,3 @@ For questions, reach out to the repository owner or open an issue.
 ---
 
 **Happy hacking!**
-
