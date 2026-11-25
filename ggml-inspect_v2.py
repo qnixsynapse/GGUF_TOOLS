@@ -20,6 +20,11 @@ each GGML quantization format would represent it.
   --imatrix FILE (llama.cpp .dat or GGUF imatrix) SQNR is weighted per input column by
   the calibration importance (the quantizers themselves are still the unweighted ones).
 * --budget-gib / --budget-bpw / --budget-sweep: size-budget allocation with --recommend.
+* --recommend adds an automatic per-tensor dB margin for heavy-tailed tensors (crest factor = max|w|/RMS,
+  excess kurtosis); tune or disable with --outlier-margin-max / --outlier-crest-ref / --outlier-kurt-ref.
+* --structure: report whether tensors have structure a quantizer cannot exploit (low rank via
+  SVD, smoothness along the index via DCT / lag-1 autocorrelation) and what size such a
+  representation would need to reach the same SQNR target (--min-sqnr).
 * Note: GPU results can differ from CPU in a handful of elements where a value sits
   exactly on a rounding boundary (fused multiply-add etc.); --selftest reports this.
 
@@ -31,6 +36,9 @@ Usage
   python ggml_quant_inspect.py model.gguf "blk.*.ffn_down*.weight" --max-rows 2048 --device cuda
   python ggml_quant_inspect.py model.gguf token_embd.weight --max-rows 0 --formats all --device xpu
   python ggml_quant_inspect.py model.gguf --recommend --min-sqnr 22 --emit-cmd quant.sh
+  python ggml_quant_inspect.py model.gguf "blk.*.attn_*.weight" --structure --min-sqnr 22
+  python ggml_quant_inspect.py model.gguf "*_exps.weight" --structure-cross-expert
+  python ggml_quant_inspect.py --expert-usage imatrix.gguf --json expert_order.json
   python ggml_quant_inspect.py --selftest --device auto
 """
 import argparse
@@ -39,6 +47,7 @@ import fnmatch
 import gc
 import io
 import json
+import math
 import re
 import sys
 import time
@@ -954,6 +963,7 @@ def inspect_tensor(path, t, fmts, args):
         print(f"99.9% Abs:        {p999:.6f}  (~{p999 / std:.1f} sigma)")
         print(f"Max Abs:          {amax:.6f}  (~{amax / std:.1f} sigma)")
         print(f"Outlier Ratio:    {amax / (p999 + 1e-8):.2f}x   (max / p99.9)")
+        print(f"Crest factor:     {amax / (std + 1e-12):.1f}   (max / RMS; ~5-6 for Gaussian at this size)")
         print(f"Excess kurtosis:  {kurt:.2f}   (0 = Gaussian)")
         print(
             "Elements beyond:  "
@@ -1029,6 +1039,7 @@ def inspect_tensor(path, t, fmts, args):
             p99=p99,
             p999=p999,
             outlier_ratio=amax / (p999 + 1e-8),
+            crest_factor=amax / (std + 1e-12),
             excess_kurtosis=kurt,
             top_cols_amax=[(int(i), float(col_amax[i])) for i in top],
             block32_range_bits=(
@@ -1176,6 +1187,29 @@ def emit_command(path, gguf, rows, imatrix=None):
         fh.write("\n".join(out) + "\n")
 
 
+def outlier_margin_db(stats, args):
+    """Extra SQNR (dB) demanded from heavy-tailed tensors, derived from the L2-normalised peak
+    (crest factor = max|w| / RMS) and the excess kurtosis. Returns (dB, driving statistic)."""
+    cap = args.outlier_margin_max
+    if cap <= 0:
+        return 0.0, None
+    crest = stats.get("crest_factor") or 0.0
+    kurt = stats.get("excess_kurtosis")
+    kurt = 0.0 if kurt is None or kurt != kurt else float(kurt)
+    d_crest = (
+        args.outlier_db_per_octave * math.log2(crest / args.outlier_crest_ref)
+        if crest > args.outlier_crest_ref
+        else 0.0
+    )
+    d_kurt = (
+        args.outlier_db_per_kurt * (kurt - args.outlier_kurt_ref)
+        if kurt > args.outlier_kurt_ref
+        else 0.0
+    )
+    d = min(cap, max(d_crest, d_kurt))
+    return (d, "crest" if d_crest >= d_kurt else "kurtosis") if d > 0 else (0.0, None)
+
+
 def run_recommend(args, reader):
     cands = parse_formats(args.candidates)
     margins = [parse_margin(m) for m in args.margin] + (
@@ -1239,7 +1273,13 @@ def run_recommend(args, reader):
         if pin and pin not in by:
             pin_missed.append(f"{t.name} ({pin})")
             pin = None
+        om, om_why = outlier_margin_db(res["stats"], args)
+        if om:
+            margin += om
+            target += om
+            base.update(margin=margin, target=target)
         base.update(
+            outlier_db=om, outlier_why=om_why, crest=res["stats"].get("crest_factor"),
             pin=pin, excluded=excl and pin is not None,
             by_fmt={k: v["sqnr_db"] for k, v in by.items()},
             outlier_ratio=res["stats"]["outlier_ratio"],
@@ -1329,6 +1369,8 @@ def run_recommend(args, reader):
             flag = "  [pinned" + (", not counted in budget]" if r["excluded"] else "]")
         elif r["floor"] is not None and r["met"]:
             flag += f"  [floor {r['floor']:g} dB]"
+        if r.get("outlier_db"):
+            flag += f"  [outlier +{r['outlier_db']:.1f} dB ({r['outlier_why']})]"
         if r.get("imp_reason") in IMP_WHY:
             flag += "  [no imatrix data: plain SQNR]"
         print(
@@ -1379,6 +1421,15 @@ def run_recommend(args, reader):
             + ", ".join(nocand[:6])
             + (" ..." if len(nocand) > 6 else "")
         )
+    ob = sorted((r for r in rows if r.get("outlier_db")), key=lambda r: -r["outlier_db"])
+    if ob:
+        print(
+            f"{len(ob)} tensor(s) were given an outlier margin (peak/RMS or kurtosis above the reference); "
+            "largest: "
+            + ", ".join(f"{r['name']} +{r['outlier_db']:.1f} dB" for r in ob[:5])
+        )
+    elif args.outlier_margin_max > 0:
+        print("No tensor exceeded the outlier thresholds (crest factor / kurtosis); no outlier margins applied.")
     unmet = [r["name"] for r in rows if r["rec"] and not r["met"]]
     if unmet:
         print(
@@ -1566,6 +1617,333 @@ def print_sweep(rows, budgets, margin_weights, min_cos=0.0):
         print(
             f"{g:7.2f}G {used / 8 / 2**30:7.2f}G {used / tot:8.2f} {mn:9.1f} {below:7d}  {mix}"
         )
+
+
+# ============================================================================
+# structure report (--structure): low rank / smoothness vs. plain quantization
+# ============================================================================
+def _dct_ortho(x):
+    """Orthonormal DCT-II along the last dim (FFT based, Parseval holds)."""
+    n = x.shape[-1]
+    v = torch.cat([x[..., 0::2], x[..., 1::2].flip(-1)], dim=-1)
+    k = torch.arange(n, dtype=x.dtype, device=x.device)
+    w = torch.polar(torch.ones_like(k), -0.5 * math.pi * k / n)
+    big = 2.0 * (torch.fft.fft(v, dim=-1) * w).real
+    scale = torch.full((n,), math.sqrt(1.0 / (2 * n)), dtype=x.dtype, device=x.device)
+    scale[0] = math.sqrt(1.0 / (4 * n))
+    return big * scale
+
+
+def _count_for_target(e, target_db, ref=None):
+    """Smallest number of leading terms of energy vector e whose residual meets target_db
+    (relative to sum(e), or to `ref` if given)."""
+    e = e.double().cpu()
+    tot = float(e.sum())
+    if tot <= 0.0:
+        return 0
+    tail = tot - torch.cumsum(e, 0)
+    ok = (tail <= (ref if ref is not None else tot) * 10.0 ** (-target_db / 10.0)).nonzero()
+    return int(ok[0]) + 1 if len(ok) else len(e)
+
+
+def _svdvals(w, dev):
+    try:
+        return torch.linalg.svdvals(w.to(dev)).cpu()
+    except Exception:  # noqa: BLE001  (op missing on this backend, or device OOM)
+        return torch.linalg.svdvals(w.cpu())
+
+
+def _lag1(x):
+    xc = x - x.mean(-1, keepdim=True)
+    den = float((xc * xc).sum())
+    if den <= 0.0 or x.shape[-1] < 2:
+        return 0.0
+    return float((xc[:, :-1] * xc[:, 1:]).sum()) / den
+
+
+def _structure_matrix(w, rows_full, args):
+    """w: float32 CPU (m, n) sample of an (rows_full, n) matrix. Sizes are for the full matrix."""
+    m, n = w.shape
+    tgt, fb = args.min_sqnr, args.structure_factor_bits
+    full = m == rows_full
+    e = _svdvals(w, args.dev).double() ** 2
+    r = _count_for_target(e, tgt)
+    out = dict(
+        stable_rank=float(e.sum() / e[0]) if float(e[0]) > 0 else 0.0,
+        rank=r,
+        rank_bpw=fb * r * (rows_full + n) / (rows_full * n),
+        ac_col=_lag1(w),
+    )
+    ec = (_dct_ortho(w) ** 2).sum(0).double()
+    out["lf10"] = float(ec[: max(1, math.ceil(0.1 * n))].sum() / ec.sum()) if float(ec.sum()) > 0 else 0.0
+    out["dct_col_bpw"] = fb * _count_for_target(ec, tgt) / n
+    if full and m > 1:  # smoothness across rows is only meaningful if rows are not subsampled
+        wt = w.t().contiguous()
+        er = (_dct_ortho(wt) ** 2).sum(0).double()
+        out["ac_row"] = _lag1(wt)
+        out["dct_row_bpw"] = fb * _count_for_target(er, tgt) / m
+    else:
+        out["ac_row"] = out["dct_row_bpw"] = None
+    return out
+
+
+def _structure_verdict(res, ref_bpw):
+    cands = [("low-rank", res["rank_bpw"]), ("smooth-cols", res["dct_col_bpw"])]
+    if res["dct_row_bpw"] is not None:
+        cands.append(("smooth-rows", res["dct_row_bpw"]))
+    kind, best = min(cands, key=lambda c: c[1])
+    if best < 0.9 * ref_bpw:
+        return kind, best
+    return ("marginal" if best < ref_bpw else "none"), best
+
+
+def structure_tensor(path, t, args):
+    src = TensorSource(path, t)
+    try:
+        cols = src.cols
+        shp = [int(s) for s in t.shape]
+        per = shp[1] if len(shp) > 2 else src.n_rows  # rows of one 2D matrix
+        n_exp = src.n_rows // per
+        eids = np.unique(np.linspace(0, n_exp - 1, min(args.structure_experts, n_exp)).astype(np.int64))
+        parts, sampled = [], False
+        for ex in eids:
+            ids = pick_rows(per, args.structure_max_rows) + int(ex) * per
+            sampled |= len(ids) < per
+            w = torch.from_numpy(src.rows(ids))
+            if min(w.shape) < 2:
+                continue
+            parts.append(_structure_matrix(w, per, args))
+        if not parts:
+            return None
+        res = {k: (None if parts[0][k] is None else float(np.mean([p[k] for p in parts]))) for k in parts[0]}
+        res.update(name=t.name, shape=shp, elements=int(t.n_elements), rows=per, cols=cols,
+                   experts=n_exp, experts_sampled=len(eids), rows_sampled=sampled)
+        res["verdict"], res["best_bpw"] = _structure_verdict(res, args.structure_ref_bpw)
+        return res
+    finally:
+        src.close()
+
+
+def run_structure(args, reader):
+    pat = args.pattern or "*"
+    todo = [t for t in reader.tensors
+            if fnmatch.fnmatch(t.name, pat) and len(t.shape) >= 2 and t.name.endswith(".weight")]
+    if not todo:
+        sys.exit("no 2D+ '.weight' tensors matched")
+    results = []
+    for i, t in enumerate(todo, 1):
+        print(f"\r[{i}/{len(todo)}] {t.name[:60]:60s}", end="", file=sys.stderr, flush=True)
+        try:
+            r = structure_tensor(args.gguf, t, args)
+        except Exception as ex:  # noqa: BLE001
+            print(f"\n{t.name}: skipped ({ex})", file=sys.stderr)
+            continue
+        if r:
+            results.append(r)
+    print(file=sys.stderr)
+    fb, ref = args.structure_factor_bits, args.structure_ref_bpw
+    print(f"Structure report: target {args.min_sqnr:g} dB, factors/coefs stored at {fb} bit, "
+          f"reference quant {ref:g} bpw")
+    print(f"{'tensor':40s} {'rows x cols':>13s} {'srank':>7s} {'r@tgt':>6s} {'rank_bpw':>8s} "
+          f"{'ac_col':>7s} {'ac_row':>7s} {'lf10':>6s} {'dctC_bpw':>8s} {'dctR_bpw':>8s}  verdict")
+    f2 = lambda v, w, p: f"{v:{w}.{p}f}" if v is not None else f"{'-':>{w}s}"  # noqa: E731
+    for r in results:
+        star = "*" if r["rows_sampled"] else " "
+        print(f"{r['name'][:40]:40s} {str(r['rows']) + 'x' + str(r['cols']):>13s}{star}"
+              f"{r['stable_rank']:7.1f} {r['rank']:6.0f} {r['rank_bpw']:8.2f} "
+              f"{r['ac_col']:7.3f} {f2(r['ac_row'], 7, 3)} {r['lf10']:6.2f} "
+              f"{r['dct_col_bpw']:8.2f} {f2(r['dct_row_bpw'], 8, 2)}  {r['verdict']} ({r['best_bpw']:.2f})")
+    tot = sum(r["elements"] for r in results) or 1
+    print("\nBy verdict (share of analysed weights):")
+    for v in ("low-rank", "smooth-cols", "smooth-rows", "marginal", "none"):
+        sel = [r for r in results if r["verdict"] == v]
+        if sel:
+            print(f"  {v:12s} {len(sel):4d} tensors  {100.0 * sum(r['elements'] for r in sel) / tot:5.1f}% of weights")
+    print("\nNotes: * = rows subsampled (r@tgt is then optimistic; raise --structure-max-rows). "
+          "Row-axis columns need all rows.\n"
+          "  white noise: ac ~ 0, lf10 ~ 0.10, srank large. 3D (expert) tensors: per-expert matrices, "
+          "averaged over the sampled experts.\n"
+          "  A verdict other than 'none' means structure beats plain quantization on SQNR only; "
+          "check task loss/KLD before relying on it.")
+    if args.json:
+        with open(args.json, "w") as fh:
+            json.dump(results, fh, indent=1, default=float)
+        print(f"Wrote {args.json}")
+
+
+def _gram(x, dev):
+    try:
+        xd = x.to(dev)
+        return (xd @ xd.t()).double().cpu()
+    except Exception:  # noqa: BLE001  (op missing / device OOM)
+        return (x @ x.t()).double()
+
+
+def cross_expert_tensor(path, t, args):
+    """Redundancy ACROSS the experts of one 3D tensor, via the E x E Gram matrix of the experts."""
+    shp = [int(s) for s in t.shape]
+    if len(shp) < 3:
+        return None
+    src = TensorSource(path, t)
+    try:
+        cols, per = src.cols, shp[1]
+        n_exp = src.n_rows // per
+        if n_exp < 2:
+            return None
+        sub = pick_rows(per, args.structure_cross_rows)  # same rows for every expert
+        x = torch.cat(
+            [torch.from_numpy(src.rows(sub + ex * per)).reshape(1, -1) for ex in range(n_exp)], 0
+        )
+        d_full, tgt, fb = per * cols, args.min_sqnr, args.structure_factor_bits
+        g = _gram(x, args.dev)
+        del x
+        tr = float(torch.trace(g))
+        if tr <= 0.0:
+            return None
+        base_share = float(g.sum()) / n_exp / tr  # energy share of the mean expert
+        delta_saved = -10.0 * math.log10(max(1.0 - base_share, 1e-12)) / 6.02
+        lam = torch.linalg.eigvalsh(g).flip(0).clamp_min(0)
+        r_raw = _count_for_target(lam, tgt)
+        gc = g - g.mean(1, keepdim=True) - g.mean(0, keepdim=True) + g.mean()
+        lam_c = torch.linalg.eigvalsh(gc).flip(0).clamp_min(0)
+        r_cen = _count_for_target(lam_c, tgt, ref=tr)
+        dg = torch.sqrt(torch.diagonal(g).clamp_min(1e-30))
+        cs = g / (dg[:, None] * dg[None, :])
+        off = ~torch.eye(n_exp, dtype=torch.bool)
+        nn = cs.masked_fill(~off, -2.0).max(1).values
+        cos_thr = math.sqrt(max(1.0 - 10.0 ** (-tgt / 10.0), 0.0))
+        res = dict(
+            name=t.name, shape=shp, elements=int(t.n_elements), experts=n_exp, rows=per, cols=cols,
+            cos_mean=float(cs[off].mean()), cos_max=float(cs[off].max()), nn_cos_mean=float(nn.mean()),
+            nn_dup=int((nn >= cos_thr).sum()), base_share=base_share, delta_saved_bpw=delta_saved,
+            rank=r_raw, rank_bpw=fb * r_raw * (n_exp + d_full) / (n_exp * d_full),
+            rank_c=r_cen, rank_c_bpw=fb * (r_cen * (n_exp + d_full) + d_full) / (n_exp * d_full),
+        )
+        best = min(res["rank_bpw"], res["rank_c_bpw"])
+        notes = []
+        if best < args.structure_ref_bpw:
+            notes.append("basis")
+        if res["nn_dup"]:
+            notes.append("dup")
+        if delta_saved >= 0.25:
+            notes.append("shared-base")
+        res["verdict"] = "+".join(notes) or "none"
+        return res
+    finally:
+        src.close()
+
+
+def run_cross_expert(args, reader):
+    pat = args.pattern or "*"
+    todo = [t for t in reader.tensors
+            if fnmatch.fnmatch(t.name, pat) and len(t.shape) >= 3 and t.name.endswith(".weight")]
+    if not todo:
+        sys.exit("no 3D '.weight' (expert) tensors matched")
+    results = []
+    for i, t in enumerate(todo, 1):
+        print(f"\r[{i}/{len(todo)}] {t.name[:60]:60s}", end="", file=sys.stderr, flush=True)
+        try:
+            r = cross_expert_tensor(args.gguf, t, args)
+        except Exception as ex:  # noqa: BLE001
+            print(f"\n{t.name}: skipped ({ex})", file=sys.stderr)
+            continue
+        if r:
+            results.append(r)
+    print(file=sys.stderr)
+    fb, ref = args.structure_factor_bits, args.structure_ref_bpw
+    print(f"Cross-expert report: target {args.min_sqnr:g} dB, {fb:g}-bit factors, ref {ref:g} bpw, "
+          f"{args.structure_cross_rows} sampled rows/expert")
+    print(f"{'tensor':36s} {'E':>4s} {'cos_avg':>7s} {'cos_max':>7s} {'nn_cos':>6s} {'nn>=tgt':>7s} "
+          f"{'base%':>6s} {'dlt_bpw':>7s} {'r@tgt':>6s} {'rk_bpw':>7s} {'rc@tgt':>6s} {'rkc_bpw':>7s}  verdict")
+    for r in results:
+        print(f"{r['name'][:36]:36s} {r['experts']:4d} {r['cos_mean']:7.3f} {r['cos_max']:7.3f} "
+              f"{r['nn_cos_mean']:6.3f} {r['nn_dup']:7d} {100 * r['base_share']:6.1f} "
+              f"{r['delta_saved_bpw']:7.2f} {r['rank']:6d} {r['rank_bpw']:7.2f} {r['rank_c']:6d} "
+              f"{r['rank_c_bpw']:7.2f}  {r['verdict']}")
+    print("\nColumns: cos_* = cosine between experts (flattened, same sampled rows); nn_cos = mean best-match "
+          "cosine; nn>=tgt = experts whose best match alone would meet the SQNR target (merge/prune candidates).\n"
+          "  base% = energy share of the mean expert; dlt_bpw = bits/weight saved if only (expert - mean) "
+          "is quantized (before storing the mean).\n"
+          "  r@tgt / rc@tgt = number of basis experts needed (raw / after removing the mean) for the target; "
+          "rk_bpw include basis storage.\n"
+          "  Experts may be permuted internally (hidden-unit order), which hides real similarity from "
+          "cosine; low values here are not proof of non-redundancy.")
+    if args.json:
+        with open(args.json, "w") as fh:
+            json.dump(results, fh, indent=1, default=float)
+        print(f"Wrote {args.json}")
+
+
+def _gini(x):
+    x = np.sort(np.asarray(x, dtype=np.float64))
+    n = len(x)
+    return float((2 * np.arange(1, n + 1) - n - 1).dot(x) / (n * x.sum())) if x.sum() > 0 else 0.0
+
+
+def run_expert_usage(args):
+    """Routing statistics per expert from the per-expert counts stored in a GGUF imatrix."""
+    path = args.expert_usage
+    r = GGUFReader(path, "r")
+    by_layer = {}
+    for t in r.tensors:
+        m = re.match(r"blk\.(\d+)\.(\w*exps)\.weight\.counts$", t.name)
+        if not m:
+            continue
+        c = np.asarray(t.data, dtype=np.float64).reshape(-1)
+        if c.size > 1:
+            by_layer.setdefault(int(m.group(1)), {})[m.group(2)] = c
+    if not by_layer:
+        sys.exit("no per-expert '*exps.weight.counts' tensors found in this imatrix")
+    layers = sorted(by_layer)
+    # the up/gate and down tensors should see identical routing; use the first one found
+    cnt = {L: next(iter(by_layer[L].values())) for L in layers}
+    n_exp = len(cnt[layers[0]])
+    uni = 1.0 / n_exp
+    share = np.array([cnt[L] / cnt[L].sum() for L in layers])
+    mb = args.usage_expert_mb
+    gib = mb * 1e6 / 2**30
+    print(f"Expert usage from {path}: {len(layers)} layers x {n_exp} experts "
+          f"(uniform share {100 * uni:.2f}%), {mb:g} MB per expert-layer assumed")
+    print(f"{'L':>3s} {'routed':>12s} {'min%':>6s} {'med%':>6s} {'max%':>6s} {'gini':>6s} "
+          f"{'<25%u':>6s} {'n@90%':>6s} {'n@95%':>6s} {'n@99%':>6s} {'top16%':>7s}")
+    for i, L in enumerate(layers):
+        p = share[i]
+        srt = np.sort(p)[::-1]
+        cs = np.cumsum(srt)
+        cov = [int(np.searchsorted(cs, q)) + 1 for q in (0.90, 0.95, 0.99)]
+        print(f"{L:3d} {cnt[L].sum():12.0f} {100 * p.min():6.2f} {100 * np.median(p):6.2f} "
+              f"{100 * p.max():6.2f} {_gini(p):6.3f} {int((p < 0.25 * uni).sum()):6d} "
+              f"{cov[0]:6d} {cov[1]:6d} {cov[2]:6d} {100 * srt[:16].sum():7.1f}")
+    print("\nA) drop the n least-used experts in every layer")
+    print(f"{'n':>4s} {'%drop':>6s} {'GiB saved':>10s} {'mean routed mass lost %':>24s} {'worst layer %':>14s}")
+    for n in sorted({4, 8, 16, 24, 32, 48, 64, n_exp // 2}):
+        if n >= n_exp:
+            continue
+        lost = np.sort(share, 1)[:, :n].sum(1)
+        print(f"{n:4d} {100 * n / n_exp:6.1f} {len(layers) * n * gib:10.2f} {100 * lost.mean():24.2f} "
+              f"{100 * lost.max():9.2f} (L{layers[int(lost.argmax())]})")
+    print("\nB) global greedy by share (lowest-share experts across all layers first)")
+    flat = sorted((share[i, e], i, e) for i in range(len(layers)) for e in range(n_exp))
+    tot = len(flat)
+    print(f"{'dropped':>8s} {'%drop':>6s} {'GiB saved':>10s} {'mean lost %':>12s} {'worst layer %':>14s} {'min kept/layer':>15s}")
+    for frac in (0.03, 0.065, 0.13, 0.26, 0.39, 0.5):
+        N = int(frac * tot)
+        keep = np.ones_like(share, dtype=bool)
+        for _, i, e in flat[:N]:
+            keep[i, e] = False
+        lost = (share * ~keep).sum(1)
+        print(f"{N:8d} {100 * N / tot:6.1f} {N * gib:10.2f} {100 * lost.mean():12.2f} "
+              f"{100 * lost.max():14.2f} {int(keep.sum(1).min()):15d}")
+    print("\nNotes: 'routed mass' = share of token->expert assignments, not of gate weight (counts only);\n"
+          "  a dropped expert's tokens would fall to the next-best expert, so quality loss is smaller than the\n"
+          "  mass shown but must be verified with KLD. Layers visited several times (looped blocks) show\n"
+          "  proportionally larger totals but the shares are comparable. Rare experts also have noisier imatrix rows.")
+    if args.json:
+        out = {str(L): dict(share=share[i].tolist(), order_least_used_first=np.argsort(share[i]).tolist())
+               for i, L in enumerate(layers)}
+        with open(args.json, "w") as fh:
+            json.dump(out, fh)
+        print(f"Wrote {args.json}")
 
 
 # ============================================================================
@@ -1760,6 +2138,96 @@ def main():
         help="pinned tensors matching REGEX do not count against --budget-gib/--budget-bpw "
         "(e.g. a CPU-resident token_embd)",
     )
+    g = ap.add_argument_group("outlier margin (--recommend)")
+    g.add_argument(
+        "--outlier-margin-max",
+        type=float,
+        default=3.0,
+        help="cap (dB) on the automatic extra SQNR target for heavy-tailed tensors; 0 disables "
+        "(default 3). Driven by crest factor (max|w|/RMS) and excess kurtosis.",
+    )
+    g.add_argument(
+        "--outlier-crest-ref",
+        type=float,
+        default=8.0,
+        help="crest factor above which a margin starts (Gaussian tensors sit around 5-6; default 8)",
+    )
+    g.add_argument(
+        "--outlier-db-per-octave",
+        type=float,
+        default=1.0,
+        help="extra dB per doubling of the crest factor above the reference (default 1)",
+    )
+    g.add_argument(
+        "--outlier-kurt-ref",
+        type=float,
+        default=3.0,
+        help="excess kurtosis above which a margin starts (0 = Gaussian; default 3)",
+    )
+    g.add_argument(
+        "--outlier-db-per-kurt",
+        type=float,
+        default=0.25,
+        help="extra dB per unit of excess kurtosis above the reference (default 0.25)",
+    )
+    g = ap.add_argument_group("structure report")
+    g.add_argument(
+        "--structure",
+        action="store_true",
+        help="report low-rank (SVD) and smoothness (DCT, lag-1 autocorrelation) structure per "
+        "2D+ .weight tensor (or those matching PATTERN) and the bpw such a representation needs "
+        "for --min-sqnr",
+    )
+    g.add_argument(
+        "--structure-max-rows",
+        type=int,
+        default=4096,
+        help="rows per matrix used for the SVD/DCT (0 = all; default 4096, rows are evenly sampled)",
+    )
+    g.add_argument(
+        "--structure-experts",
+        type=int,
+        default=2,
+        help="for 3D (expert) tensors: how many experts to analyse per tensor (default 2)",
+    )
+    g.add_argument(
+        "--structure-ref-bpw",
+        type=float,
+        default=4.5,
+        help="quantization size to beat, in bpw (default 4.5 = q4_k)",
+    )
+    g.add_argument(
+        "--structure-cross-expert",
+        action="store_true",
+        help="redundancy ACROSS the experts of each 3D tensor: cosine / near-duplicates, shared "
+        "mean expert, number of basis experts needed for --min-sqnr",
+    )
+    g.add_argument(
+        "--structure-cross-rows",
+        type=int,
+        default=256,
+        help="rows per expert (same rows for all experts) used for --structure-cross-expert "
+        "(0 = all; default 256)",
+    )
+    g.add_argument(
+        "--expert-usage",
+        metavar="IMATRIX_GGUF",
+        help="per-expert routing statistics and an expert-pruning trade-off table from the counts in "
+        "a GGUF imatrix (the model file is not needed)",
+    )
+    g.add_argument(
+        "--usage-expert-mb",
+        type=float,
+        default=4.81,
+        help="MB per expert per layer for the --expert-usage size estimate "
+        "(default 4.81 = this model's gate_up q4_k + down q5_0)",
+    )
+    g.add_argument(
+        "--structure-factor-bits",
+        type=float,
+        default=16.0,
+        help="bits per stored low-rank factor / DCT coefficient (default 16)",
+    )
     args = ap.parse_args()
 
     if args.list_formats:
@@ -1769,6 +2237,8 @@ def main():
     if args.selftest:
         args.dev = setup_device(args.device)
         return selftest(args)
+    if args.expert_usage:
+        return run_expert_usage(args)
     if not args.gguf:
         ap.error("gguf path required")
 
@@ -1783,7 +2253,9 @@ def main():
         args.max_rows = 1024 if args.recommend else 8192
     print(f"Reading header from {args.gguf}...")
     reader = GGUFReader(args.gguf, "r")
-    if not args.recommend and (args.list or not args.pattern):
+    if not (args.recommend or args.structure or args.structure_cross_expert) and (
+        args.list or not args.pattern
+    ):
         for t in reader.tensors:
             print(f"{t.name:50s} {t.tensor_type.name:8s} {[int(s) for s in t.shape]}")
         return
@@ -1795,6 +2267,12 @@ def main():
 
     if args.recommend:
         run_recommend(args, reader)
+        return
+    if args.structure_cross_expert:
+        run_cross_expert(args, reader)
+        return
+    if args.structure:
+        run_structure(args, reader)
         return
     matches = [t for t in reader.tensors if fnmatch.fnmatch(t.name, args.pattern)]
     if not matches:
